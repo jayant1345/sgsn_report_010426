@@ -34,4 +34,9 @@ MB = 1048576
 APP_TITLE = "SGSN Report Tool — BSNL Gujarat NOC"
 APP_VERSION = "v2.0 (Python)"
 
+# ZTE GGSN closure — after this date DT carries signaling only (no data).
+# All DT data traffic is redirected through p_obs_zte_lan_4g_tput (files 7-13).
+# p_obs_zte_lan (files 0-6) carries only DT signaling from this date onward.
+ZTE_GGSN_CUTOVER_DATE = "2026-03-30"
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)

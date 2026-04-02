@@ -35,7 +35,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from db import pg_query, my_query
-from config import OUTPUT_DIR
+from config import OUTPUT_DIR, ZTE_GGSN_CUTOVER_DATE
 from tcs_reader import read_tcs_daily
 from tcs_store  import store_tcs, load_tcs_month, load_tcs_day
 from file_resolver import resolve_tcs_file
@@ -313,6 +313,54 @@ def _lan_month_daily(year, month):
             GROUP BY 1 ORDER BY 1
         """, {'y': year, 'm': month})
         return {int(r['day_']): r for r in rows}
+    except Exception:
+        return {}
+
+
+def _prtg4g_hourly_adj(date_str, g4_h):
+    """
+    POST-CUTOVER (>= ZTE_GGSN_CUTOVER_DATE): NIB/DT hourly data.
+    Reads p_obs_zte_lan_4g_tput (which now carries Nokia 4G + Nokia 2G/3G + DT data)
+    then subtracts Nokia 4G per-hour so remaining = Nokia 2G/3G + DT data.
+    This replaces _lan_total_hourly for dates after the cutover.
+    Returns same dict format as _lan_total_hourly: {hr: {dl_mb, ul_mb, down_speed, ...}}
+    """
+    try:
+        rows = pg_query("""
+            SELECT extract(hour FROM t.date_time)::int        AS hr,
+                sum(t.sum_in_kb)/1024.0                           AS dl_mb,
+                sum(t.sum_out_kb)/1024.0                          AS ul_mb,
+                max(t.avg_in_spd)/1024.0                          AS down_speed,
+                max(t.avg_out_spd)/1024.0                         AS up_speed,
+                max(t.avg_in_spd + t.avg_out_spd)/1024.0          AS tot_speed
+            FROM (
+                SELECT date_time,
+                       sum(coalesce(in_volume_kb,0))  AS sum_in_kb,
+                       sum(coalesce(out_volume_kb,0)) AS sum_out_kb,
+                       avg(coalesce(in_speed_kbps,0)) AS avg_in_spd,
+                       avg(coalesce(out_speed_kbps,0))AS avg_out_spd
+                FROM public.p_obs_zte_lan_4g_tput
+                WHERE date(date_time)=%(dt)s
+                GROUP BY date_time
+            ) t
+            GROUP BY extract(hour FROM t.date_time)
+            ORDER BY 1
+        """, {'dt': date_str})
+        result = {}
+        for r in rows:
+            hr = int(r['hr'])
+            g  = g4_h.get(hr, {})
+            # Subtract Nokia 4G hourly volume so only Nokia 2G/3G + DT data remains
+            g4_dl = _safe(g.get('dl_mb', 0))
+            g4_ul = _safe(g.get('ul_mb', 0))
+            result[hr] = {
+                'dl_mb':     max(0.0, _safe(r['dl_mb'])    - g4_dl),
+                'ul_mb':     max(0.0, _safe(r['ul_mb'])    - g4_ul),
+                'down_speed': _safe(r['down_speed']),
+                'up_speed':   _safe(r['up_speed']),
+                'tot_speed':  _safe(r['tot_speed']),
+            }
+        return result
     except Exception:
         return {}
 
@@ -667,7 +715,8 @@ def _trai_month(year, month):
 # =============================================================================
 
 def _build_mar26(wb, year, month, month_name, report_day,
-                 nokia_daily, nokia4g_daily, lan_daily, tcs_daily):
+                 nokia_daily, nokia4g_daily, lan_daily, tcs_daily,
+                 cutover_day=None):
     """
     MAR-26 confirmed sources:
       Nokia U/L → nokia_sgsn_report_out: sum(upload_2g+upload_3g) per day  (MB→GB)
@@ -718,15 +767,28 @@ def _build_mar26(wb, year, month, month_name, report_day,
         daily[d]['nok_ul'] = _safe(n.get('ul_mb', 0)) / MB_TO_GB
         daily[d]['nok_dl'] = _safe(n.get('dl_mb', 0)) / MB_TO_GB
 
-        # DT (Direct Tunneling) = p_obs_zte_lan_4g_tput_total - Nokia_2G3G
-        # ZTE SGSN is shutdown → ZTE contribution is zero
-        # DT_UL = prtg4g_UL - Nokia_UL  (current value after subtraction)
-        # DT_DL = prtg4g_DL - Nokia_DL  (current value after subtraction)
+        # DT (Direct Tunneling) calculation — formula depends on cutover date.
+        #
+        # BEFORE cutover (cutover_day is None or d < cutover_day):
+        #   p_obs_zte_lan_4g_tput carries Nokia_2G3G + DT data combined.
+        #   DT = prtg4g_total - Nokia_2G3G - ZTE_2G3G (ZTE=0 since shutdown)
+        #
+        # AFTER cutover (d >= cutover_day, ZTE GGSN closed):
+        #   DT carries signaling ONLY — no data traffic.
+        #   p_obs_zte_lan_4g_tput now carries Nokia_2G3G + Nokia_4G + diverted DT data.
+        #   DT_data = prtg4g_total - Nokia_2G3G - Nokia_4G  (residual = diverted DT data)
         l = lan_daily.get(d, {})
         nib_ul_gb = _safe(l.get('ul_gb', 0))
         nib_dl_gb = _safe(l.get('dl_gb', 0))
-        daily[d]['dt_ul'] = max(0.0, nib_ul_gb - daily[d]['nok_ul'] - daily[d]['zte_ul'])
-        daily[d]['dt_dl'] = max(0.0, nib_dl_gb - daily[d]['nok_dl'] - daily[d]['zte_dl'])
+        if cutover_day is not None and d >= cutover_day:
+            g = nokia4g_daily.get(d, {})
+            nok4g_ul = _safe(g.get('ul_mb', 0)) / MB_TO_GB
+            nok4g_dl = _safe(g.get('dl_mb', 0)) / MB_TO_GB
+            daily[d]['dt_ul'] = max(0.0, nib_ul_gb - daily[d]['nok_ul'] - nok4g_ul)
+            daily[d]['dt_dl'] = max(0.0, nib_dl_gb - daily[d]['nok_dl'] - nok4g_dl)
+        else:
+            daily[d]['dt_ul'] = max(0.0, nib_ul_gb - daily[d]['nok_ul'] - daily[d]['zte_ul'])
+            daily[d]['dt_dl'] = max(0.0, nib_dl_gb - daily[d]['nok_dl'] - daily[d]['zte_dl'])
 
         # 4G from nokia_4g_sgsn_report (MB → GB)
         g = nokia4g_daily.get(d, {})
@@ -1101,7 +1163,8 @@ def _build_total(wb, date_str, dt, zte_h, nokia_h, g4_h, lan_total_h):
 # =============================================================================
 
 def _build_5min(wb, year, month, report_day,
-               zte_5m, nokia_5m, lan_5m, g4_5m, prtg_5m):
+               zte_5m, nokia_5m, lan_5m, g4_5m, prtg_5m,
+               cutover_day=None):
     """
     5 Min sheet — 288 5-min slots x report_day date columns.
     Confirmed sources from reference XLS:
@@ -1158,10 +1221,24 @@ def _build_5min(wb, year, month, report_day,
         nokia_d.setdefault(d, {})
         nokia_d[d][period_slot] = nokia_d[d].get(period_slot, 0.0) + gb
 
+    # Build prtg_d from prtg_5m: {day: {slot: gb}} — needed for post-cutover NIB
+    prtg_d = {}
+    for r in prtg_5m:
+        ts = r.get('ts')
+        if not ts: continue
+        d = int(r['day']); slot = (ts.hour*60+ts.minute)//5
+        gb = (_safe(r.get('dl_mb',0)) + _safe(r.get('ul_mb',0))) / MB_TO_GB
+        prtg_d.setdefault(d, {})[slot] = prtg_d.get(d,{}).get(slot,0.0) + gb
+
     for r in lan_5m:
         ts = r.get('ts')
         if not ts: continue
         d = int(r['day']); slot = (ts.hour*60+ts.minute)//5
+        # Before cutover: use p_obs_zte_lan (LAN switch) directly
+        # After cutover:  p_obs_zte_lan carries only DT signaling — skip it;
+        #                 NIB will be computed from prtg_d below instead
+        if cutover_day is not None and d >= cutover_day:
+            continue
         gb = (_safe(r.get('dl_mb',0)) + _safe(r.get('ul_mb',0))) / MB_TO_GB
         lan_d.setdefault(d, {})[slot] = lan_d.get(d,{}).get(slot,0.0) + gb
 
@@ -1169,6 +1246,22 @@ def _build_5min(wb, year, month, report_day,
         d = int(r['day_']); hr = int(r['hr'])
         gb = (_safe(r.get('dl_mb',0)) + _safe(r.get('ul_mb',0))) / MB_TO_GB / 12.0
         g4_d.setdefault(d, {})[hr] = gb
+
+    # For post-cutover days: NIB = prtg4g_5m - Nokia_4G_per_slot
+    # prtg4g now carries Nokia_2G3G + Nokia_4G + DT data.
+    # Subtracting Nokia_4G (hourly, spread to 12 slots) leaves Nokia_2G3G + DT data,
+    # which is what NIB column represents (matches pre-cutover semantics).
+    if cutover_day is not None:
+        for d in range(cutover_day, report_day + 1):
+            if d not in prtg_d:
+                continue
+            for slot, prtg_gb in prtg_d[d].items():
+                hr = (slot * 5) // 60
+                g4_per_slot = g4_d.get(d, {}).get(hr, 0.0)
+                nok_per_slot = nokia_d.get(d, {}).get((slot // 3) * 3, 0.0)
+                # NIB = prtg - Nokia_4G - Nokia_2G3G (DT data residual)
+                nib_gb = max(0.0, prtg_gb - g4_per_slot - nok_per_slot)
+                lan_d.setdefault(d, {})[slot] = nib_gb
 
     # Track per-column values for MAX and Total rows
     dsv = {d: [[] for _ in range(CPD)] for d in range(1, days+1)}
@@ -1541,6 +1634,20 @@ def generate_daily_report(date_str, tcs_file=None, log=print):
 
     log(f"[DailyReport] Starting {date_str}")
 
+    # ── Determine ZTE GGSN cutover state ─────────────────────────────────────
+    is_post_cutover = date_str >= ZTE_GGSN_CUTOVER_DATE
+    _cutover_dt     = datetime.strptime(ZTE_GGSN_CUTOVER_DATE, "%Y-%m-%d")
+    # cutover_day_in_month: the day-of-month when cutover happened (only if same month/year)
+    if year == _cutover_dt.year and month == _cutover_dt.month:
+        cutover_day_in_month = _cutover_dt.day
+    else:
+        cutover_day_in_month = None  # all days pre-cutover or all post-cutover
+    if is_post_cutover and cutover_day_in_month is None:
+        # entire month is post-cutover
+        cutover_day_in_month = 1
+    log(f"[DailyReport] Cutover: {ZTE_GGSN_CUTOVER_DATE}  "
+        f"post_cutover={is_post_cutover}  cutover_day_in_month={cutover_day_in_month}")
+
     # ── Hourly data (for SGSNZTE, SGSNNOKIA, Total, 4G sheets) ──────────────
     log("[DailyReport] ZTE hourly...")
     zte_h       = _zte_hourly(date_str)
@@ -1548,8 +1655,14 @@ def generate_daily_report(date_str, tcs_file=None, log=print):
     nokia_h     = _nokia_hourly(date_str)
     log("[DailyReport] Nokia 4G hourly...")
     g4_h        = _nokia_4g_hourly(date_str)
-    log("[DailyReport] LAN/NIB total hourly...")
-    lan_total_h = _lan_total_hourly(date_str)
+    if is_post_cutover:
+        # After cutover: p_obs_zte_lan carries only DT signaling.
+        # Use p_obs_zte_lan_4g_tput (adjusted: minus Nokia 4G) for NIB hourly data.
+        log("[DailyReport] POST-CUTOVER: using PRTG4G-adjusted for NIB/DT hourly...")
+        lan_total_h = _prtg4g_hourly_adj(date_str, g4_h)
+    else:
+        log("[DailyReport] LAN/NIB total hourly...")
+        lan_total_h = _lan_total_hourly(date_str)
     log("[DailyReport] 4G KPI (EMM/EPS/VoLTE)...")
     kpi_data    = _4g_kpi_hourly(date_str)
 
@@ -1593,11 +1706,13 @@ def generate_daily_report(date_str, tcs_file=None, log=print):
     wb = Workbook()
 
     _build_mar26(wb, year, month, mname, day,
-                 nokia_daily, nokia4g_daily, lan_daily, tcs_daily)
+                 nokia_daily, nokia4g_daily, lan_daily, tcs_daily,
+                 cutover_day=cutover_day_in_month)
     _build_node_sheet(wb, "SGSNZTE",   date_str, dt, zte_h,   {}, {}, is_nokia=False)
     _build_node_sheet(wb, "SGSNNOKIA", date_str, dt, nokia_h, {}, {}, is_nokia=True)
     _build_total(wb, date_str, dt, zte_h, nokia_h, g4_h, lan_total_h)
-    _build_5min(wb, year, month, day, zte_5m, nokia_5m, lan_5m, g4_5m, prtg_5m)
+    _build_5min(wb, year, month, day, zte_5m, nokia_5m, lan_5m, g4_5m, prtg_5m,
+                cutover_day=cutover_day_in_month)
     _build_peak(wb, year, month, day, zte_5m, nokia_5m, lan_5m, prtg_5m)
     _build_4g(wb, date_str, dt, kpi_data)
     _build_trai(wb, year, month, day, trai)

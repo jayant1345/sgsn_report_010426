@@ -13,6 +13,7 @@
 
 from db import pg_query, pg_execute, pg_execute_many, my_execute, my_query
 from tcs_store import load_tcs_day
+from config import ZTE_GGSN_CUTOVER_DATE
 
 MB_TO_GB = 1024.0
 
@@ -62,14 +63,14 @@ def download_sgsn_summary(date_str, log=print):
     """, (date_str,))
     zte_gb = float((zte_rows[0]["total_gb"] or 0)) if zte_rows else 0
 
-    # ── LAN / Direct Tunneling (in+out_volume_kb / 1024 = MB, /1024 = GB) ─
-    log("[downldSgsn] Reading LAN (DT) volume...")
-    lan_rows = pg_query("""
-        SELECT SUM(in_volume_kb + out_volume_kb) / 1024.0 / 1024.0 AS total_gb
-        FROM public.p_obs_zte_lan
+    # ── PRTG 4G LAN (p_obs_zte_lan_4g_tput) — carries Nokia+DT combined traffic ──
+    log("[downldSgsn] Reading PRTG 4G LAN (DT) volume...")
+    prtg4g_rows = pg_query("""
+        SELECT SUM(coalesce(in_volume_kb,0) + coalesce(out_volume_kb,0)) / 1024.0 / 1024.0 AS total_gb
+        FROM public.p_obs_zte_lan_4g_tput
         WHERE date(date_time) = %s
     """, (date_str,))
-    lan_gb = float((lan_rows[0]["total_gb"] or 0)) if lan_rows else 0
+    prtg4g_gb = float((prtg4g_rows[0]["total_gb"] or 0)) if prtg4g_rows else 0
 
     # ── Nokia SGSN 2G+3G (flns counters in MB, /1024 = GB) ───────────────
     log("[downldSgsn] Reading Nokia SGSN 2G+3G volume...")
@@ -87,18 +88,33 @@ def download_sgsn_summary(date_str, log=print):
     except Exception:
         tcs_gb = 0.0
 
-    # ── DT (Direct Tunneling) = NIB raw − Nokia 2G/3G − ZTE 2G/3G ───────
-    # p_obs_zte_lan carries ALL traffic (Nokia + ZTE + DT combined)
-    # Subtract Nokia and ZTE SGSN portions to isolate Direct Tunnel traffic
-    dt_gb = max(0.0, round(lan_gb - nokia_gb - zte_gb, 4))
+    # ── DT (Direct Tunneling) — formula depends on cutover date ──────────
+    # BEFORE cutover (< 2026-03-30):
+    #   p_obs_zte_lan_4g_tput carries Nokia SGSN 2G/3G + DT data combined.
+    #   DT = prtg4g_total - Nokia_2G3G
+    #   Total = DT + Nokia_2G3G + Nokia_4G + TCS = prtg4g + Nokia_4G + TCS
+    #
+    # AFTER cutover (>= 2026-03-30, ZTE GGSN closed):
+    #   DT carries signaling only (no data).
+    #   p_obs_zte_lan_4g_tput now carries Nokia_2G3G + Nokia_4G + diverted DT data.
+    #   DT_data = prtg4g_total - Nokia_2G3G - Nokia_4G  (residual = diverted DT data)
+    #   Total = DT_data + Nokia_2G3G + Nokia_4G + TCS = prtg4g + TCS (no double-count)
+    is_post_cutover = date_str >= ZTE_GGSN_CUTOVER_DATE
+    if is_post_cutover:
+        dt_gb = max(0.0, round(prtg4g_gb - nokia_gb - nokia_4g_gb, 4))
+    else:
+        dt_gb = max(0.0, round(prtg4g_gb - nokia_gb, 4))
+    lan_gb = prtg4g_gb  # keep lan_gb for return value / logging
 
-    # ── Grand total = DT + Nokia + ZTE + 4G + TCS ────────────────────────
-    # = lan_gb + nokia_4g_gb + tcs_gb  (numerically equivalent, no double-counting)
-    total_gb = dt_gb + nokia_gb + zte_gb + nokia_4g_gb + tcs_gb
+    # ── Grand total = DT + Nokia + 4G + TCS (ZTE=0, shutdown) ───────────
+    # Simplifies to: prtg4g + Nokia_4G + TCS (pre-cutover)
+    #             or: prtg4g + TCS           (post-cutover, Nokia_4G in prtg4g)
+    total_gb = dt_gb + nokia_gb + nokia_4g_gb + tcs_gb
 
+    cutover_flag = " [POST-CUTOVER: DT=signaling-only]" if is_post_cutover else ""
     log(f"[downldSgsn] ZTE={zte_gb:.2f}GB  Nokia2G3G={nokia_gb:.2f}GB  "
-        f"DT={dt_gb:.2f}GB  4G={nokia_4g_gb:.2f}GB  "
-        f"TCS={tcs_gb:.2f}GB  Total={total_gb:.2f}GB")
+        f"PRTG4G={prtg4g_gb:.2f}GB  DT={dt_gb:.2f}GB  4G={nokia_4g_gb:.2f}GB  "
+        f"TCS={tcs_gb:.2f}GB  Total={total_gb:.2f}GB{cutover_flag}")
 
     # ── Write to MySQL downldSgsn (all in GB) ─────────────────────────────
     log("[downldSgsn] Writing to MySQL downldSgsn...")
